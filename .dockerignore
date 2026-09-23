@@ -1,0 +1,7 @@
+.git
+.env*
+!.env.example
+.vinext
+dist
+node_modules
+s30-web
