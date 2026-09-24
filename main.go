@@ -14,7 +14,15 @@ import (
 func main() {
 	cfg := configFromEnvironment()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	handler := newServer(cfg, http.DefaultClient, logger)
+
+	store, err := openDB(cfg.dbPath)
+	if err != nil {
+		logger.Error("failed to open database", "error", err, "path", cfg.dbPath)
+		os.Exit(1)
+	}
+	defer store.Close()
+
+	handler := newServer(cfg, store, http.DefaultClient, logger)
 
 	httpServer := &http.Server{
 		Addr:              cfg.address,

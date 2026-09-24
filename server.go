@@ -27,6 +27,7 @@ const (
 type config struct {
 	address        string
 	staticDir      string
+	dbPath         string
 	githubToken    string
 	githubOwner    string
 	githubRepo     string
@@ -58,6 +59,7 @@ func configFromEnvironment() config {
 	return config{
 		address:        ":" + port,
 		staticDir:      environmentOrDefault("STATIC_DIR", "public"),
+		dbPath:         environmentOrDefault("DB_PATH", "s30.db"),
 		githubToken:    os.Getenv("GITHUB_TOKEN"),
 		githubOwner:    environmentOrDefault("GITHUB_REPO_OWNER", "benprew"),
 		githubRepo:     environmentOrDefault("GITHUB_REPO_NAME", "s30"),
@@ -72,12 +74,84 @@ func environmentOrDefault(name, fallback string) string {
 	return fallback
 }
 
-func newServer(cfg config, client *http.Client, logger *slog.Logger) http.Handler {
+func newServer(cfg config, store *dbStore, client *http.Client, logger *slog.Logger) http.Handler {
+	if store == nil {
+		var err error
+		store, err = openDB(":memory:")
+		if err != nil {
+			logger.Error("failed to open default in-memory database", "error", err)
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/api/bug-reports", bugReportHandler(cfg, client, logger))
+
+	auth := authMiddleware(store)
+	mux.HandleFunc("/api/auth/register", withCORS(registerHandler(store)))
+	mux.HandleFunc("/api/auth/login", withCORS(loginHandler(store)))
+	mux.HandleFunc("/api/auth/logout", withCORS(auth(logoutHandler(store))))
+	mux.HandleFunc("/api/auth/me", withCORS(auth(meHandler())))
+
+	mux.HandleFunc("/api/games", withCORS(auth(listGamesHandler(store))))
+	mux.HandleFunc("/api/games/", withCORS(auth(gameItemHandler(store))))
+
+	mux.HandleFunc("/api/saves", withCORS(auth(listSavesHandler(store))))
+	mux.HandleFunc("/api/saves/", withCORS(auth(saveItemHandler(store))))
+
 	mux.Handle("/", staticHandler(cfg.staticDir))
 	return securityHeaders(mux)
+}
+
+func withCORS(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		setCORSHeaders(w)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
+func gameItemHandler(store *dbStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		gameID := extractGameID(r)
+		if gameID == "" && r.Method == http.MethodGet {
+			listGamesHandler(store)(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			getGameHandler(store)(w, r)
+		case http.MethodDelete:
+			deleteGameHandler(store)(w, r)
+		default:
+			w.Header().Set("Allow", "GET, DELETE, OPTIONS")
+			writeJSON(w, http.StatusMethodNotAllowed, saveResponse{Error: "Method not allowed"})
+		}
+	}
+}
+
+func saveItemHandler(store *dbStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		gameID := extractGameID(r)
+		if gameID == "" && r.Method == http.MethodGet {
+			listSavesHandler(store)(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			getSaveHandler(store)(w, r)
+		case http.MethodPut, http.MethodPost:
+			putSaveHandler(store)(w, r)
+		case http.MethodDelete:
+			deleteSaveHandler(store)(w, r)
+		default:
+			w.Header().Set("Allow", "GET, PUT, POST, DELETE, OPTIONS")
+			writeJSON(w, http.StatusMethodNotAllowed, saveResponse{Error: "Method not allowed"})
+		}
+	}
 }
 
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
@@ -266,8 +340,9 @@ func securityHeaders(next http.Handler) http.Handler {
 
 func setCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, If-Match, X-Save-Revision, Accept-Encoding, Content-Encoding")
+	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Save-Revision, X-Save-Name, X-Save-Version")
 	w.Header().Set("Access-Control-Max-Age", "86400")
 }
 

@@ -119,7 +119,7 @@ func TestStaticHandlerServesLandingPage(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(staticDir, "index.html"), []byte("<h1>Shandalar</h1>"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	handler := newServer(config{staticDir: staticDir}, http.DefaultClient, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler := newServer(config{staticDir: staticDir}, nil, http.DefaultClient, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Shandalar") {
@@ -135,5 +135,5 @@ func newTestServer(t *testing.T, cfg config) http.Handler {
 			t.Fatal(err)
 		}
 	}
-	return newServer(cfg, http.DefaultClient, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return newServer(cfg, nil, http.DefaultClient, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
