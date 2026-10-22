@@ -104,6 +104,12 @@ func (s *dbStore) Close() error {
 
 func (s *dbStore) migrate() error {
 	schema := `
+	CREATE TABLE IF NOT EXISTS bug_reports (
+		id TEXT PRIMARY KEY,
+		data BLOB NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
 		username TEXT NOT NULL UNIQUE COLLATE NOCASE,

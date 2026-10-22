@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,13 +16,12 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 const (
-	maxRequestBytes = 2_000_000
+	maxRequestBytes = 16 << 20
 	maxTitleRunes   = 220
-	maxBodyRunes    = 62_000
+	maxBodyRunes    = 12_000
 )
 
 type config struct {
@@ -32,13 +32,15 @@ type config struct {
 	githubOwner    string
 	githubRepo     string
 	githubEndpoint string
+	publicBaseURL  string
 }
 
 type bugReportPayload struct {
-	Title   string          `json:"title"`
-	Body    string          `json:"body"`
-	IsCrash bool            `json:"is_crash"`
-	Report  json.RawMessage `json:"report"`
+	Title            string          `json:"title"`
+	Body             string          `json:"body"`
+	IsCrash          bool            `json:"is_crash"`
+	Report           json.RawMessage `json:"report"`
+	CompressedReport []byte          `json:"-"`
 }
 
 type githubIssue struct {
@@ -52,6 +54,7 @@ type submitResult struct {
 	IssueNumber int    `json:"issue_number,omitempty"`
 	Message     string `json:"message,omitempty"`
 	Error       string `json:"error,omitempty"`
+	ReportURL   string `json:"report_url,omitempty"`
 }
 
 func configFromEnvironment() config {
@@ -64,6 +67,7 @@ func configFromEnvironment() config {
 		githubOwner:    environmentOrDefault("GITHUB_REPO_OWNER", "benprew"),
 		githubRepo:     environmentOrDefault("GITHUB_REPO_NAME", "s30"),
 		githubEndpoint: environmentOrDefault("GITHUB_API_URL", "https://api.github.com"),
+		publicBaseURL:  environmentOrDefault("PUBLIC_BASE_URL", "https://s30.throwingbones.com"),
 	}
 }
 
@@ -85,7 +89,8 @@ func newServer(cfg config, store *dbStore, client *http.Client, logger *slog.Log
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/api/bug-reports", bugReportHandler(cfg, client, logger))
+	mux.HandleFunc("/api/bug-reports", bugReportHandler(cfg, store, client, logger))
+	mux.HandleFunc("/api/bug-reports/{id}", bugReportDownloadHandler(store, logger))
 
 	auth := authMiddleware(store)
 	mux.HandleFunc("/api/auth/register", withCORS(registerHandler(store)))
@@ -158,7 +163,7 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func bugReportHandler(cfg config, client *http.Client, logger *slog.Logger) http.HandlerFunc {
+func bugReportHandler(cfg config, store *dbStore, client *http.Client, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		setCORSHeaders(w)
 		if r.Method == http.MethodOptions {
@@ -172,25 +177,34 @@ func bugReportHandler(cfg config, client *http.Client, logger *slog.Logger) http
 		}
 
 		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		if err != nil || mediaType != "application/json" {
-			writeJSON(w, http.StatusUnsupportedMediaType, submitResult{Error: "Content-Type must be application/json"})
+		if err != nil || (mediaType != "application/json" && mediaType != "multipart/form-data") {
+			writeJSON(w, http.StatusUnsupportedMediaType, submitResult{Error: "Content-Type must be application/json or multipart/form-data"})
 			return
 		}
-
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
-		decoder := json.NewDecoder(r.Body)
 		var payload bugReportPayload
-		if err := decoder.Decode(&payload); err != nil {
+		if mediaType == "multipart/form-data" {
+			payload, err = readBugReportMultipart(r)
+		} else {
+			decoder := json.NewDecoder(r.Body)
+			err = decoder.Decode(&payload)
+			if err == nil {
+				endErr := decoder.Decode(&struct{}{})
+				if !errors.Is(endErr, io.EOF) {
+					if endErr == nil {
+						endErr = errors.New("request body must contain one JSON object")
+					}
+					err = endErr
+				}
+			}
+		}
+		if err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
 				writeJSON(w, http.StatusRequestEntityTooLarge, submitResult{Error: "Report is too large"})
-				return
+			} else {
+				writeJSON(w, http.StatusBadRequest, submitResult{Error: "Invalid report upload"})
 			}
-			writeJSON(w, http.StatusBadRequest, submitResult{Error: "Request body is not valid JSON"})
-			return
-		}
-		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-			writeJSON(w, http.StatusBadRequest, submitResult{Error: "Request body must contain one JSON object"})
 			return
 		}
 
@@ -200,21 +214,37 @@ func bugReportHandler(cfg config, client *http.Client, logger *slog.Logger) http
 			writeJSON(w, http.StatusBadRequest, submitResult{Error: "Report body is required"})
 			return
 		}
-		bodyWasTruncated := utf8.RuneCountInString(payload.Body) > maxBodyRunes
-		payload.Body = truncateRunes(payload.Body, maxBodyRunes)
-		if bodyWasTruncated {
-			payload.Body += "\n\n_Report truncated by the bug report service._"
-		}
 
 		if cfg.githubToken == "" {
 			writeJSON(w, http.StatusServiceUnavailable, submitResult{Error: "Bug report service is not configured"})
 			return
 		}
 
+		report := payload.CompressedReport
+		if report == nil {
+			report = bytes.TrimSpace(payload.Report)
+		}
+		if payload.CompressedReport == nil && (len(report) == 0 || report[0] != '{') {
+			writeJSON(w, http.StatusBadRequest, submitResult{Error: "Report must be a JSON object"})
+			return
+		}
+		id, err := store.storeBugReport(r.Context(), report)
+		if err != nil {
+			logger.Error("could not store bug report", "error", err)
+			writeJSON(w, http.StatusInternalServerError, submitResult{Error: "Could not store the report"})
+			return
+		}
+		baseURL := cfg.publicBaseURL
+		if baseURL == "" {
+			baseURL = "https://s30.throwingbones.com"
+		}
+		reportURL := strings.TrimRight(baseURL, "/") + "/api/bug-reports/" + id
+		payload.Body = bugReportIssueBody(payload.Body, reportURL)
+
 		issue, err := createGitHubIssue(r.Context(), cfg, client, payload)
 		if err != nil {
 			logger.Error("bug report submission failed", "error", err)
-			writeJSON(w, http.StatusBadGateway, submitResult{Error: "Could not create the issue"})
+			writeJSON(w, http.StatusBadGateway, submitResult{Error: "Report stored, but could not create the issue", ReportURL: reportURL})
 			return
 		}
 
@@ -223,6 +253,7 @@ func bugReportHandler(cfg config, client *http.Client, logger *slog.Logger) http
 			IssueURL:    issue.HTMLURL,
 			IssueNumber: issue.Number,
 			Message:     fmt.Sprintf("Created issue #%d", issue.Number),
+			ReportURL:   reportURL,
 		})
 	}
 }
